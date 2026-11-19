@@ -1,0 +1,438 @@
+import express from 'express';
+import { createServer } from 'http';
+import { Server } from 'socket.io';
+import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import morgan from 'morgan';
+import config from './config/env.js';
+import { connectDB, backfillQChatIds, backfillLeaves, User, Message } from './db/database.js';
+import authRoutes from './routes/auth.js';
+import messageRoutes from './routes/messages.js';
+import userRoutes from './routes/users.js';
+import demoRoutes from './routes/demo.js';
+import { authenticateSocket } from './middleware/auth.js';
+import { logger } from './utils/logger.js';
+import { isValidObjectId, approximateSize } from './utils/validation.js';
+import { serializeMessage } from './utils/serialize.js';
+import { leafForMessage } from './utils/merkleLeaf.js';
+import mongoose from 'mongoose';
+
+// ── Connect to MongoDB ──
+connectDB()
+  .then(backfillQChatIds)
+  .then(backfillLeaves)
+  .catch(err => logger.error('Startup database work failed', { message: err.message }, 'DB'));
+
+const app = express();
+const httpServer = createServer(app);
+const io = new Server(httpServer, {
+  cors: { origin: config.corsOrigin, methods: ['GET', 'POST'] },
+  // Default is 1MB, which silently drops the connection as soon as an
+  // encrypted attachment is attached to a message.
+  maxHttpBufferSize: config.maxMessageBytes,
+});
+
+const ALLOWED_MESSAGE_TYPES = ['text', 'image', 'audio', 'file'];
+
+/**
+ * Presence is derived from socket.io rooms: every socket joins a room named
+ * after its user id, so a user with several tabs open is still one "user", and
+ * every tab receives their messages.
+ */
+const isUserOnline = (userId) => (io.sockets.adapter.rooms.get(String(userId))?.size ?? 0) > 0;
+
+/**
+ * Everyone with a reason to see this user's presence: their contacts, anyone
+ * who has them as a contact, and anyone they share a conversation with.
+ * Presence used to go to every connected socket, which told every account on
+ * the server who was online and when.
+ */
+async function presenceAudience(userId) {
+  const [me, addedBy, receivedFrom, sentTo] = await Promise.all([
+    User.findById(userId).select('contacts').lean(),
+    User.find({ contacts: userId }).distinct('_id'),
+    Message.distinct('from_user_id', { to_user_id: userId }),
+    Message.distinct('to_user_id', { from_user_id: userId }),
+  ]);
+  const ids = new Set([...(me?.contacts || []), ...addedBy, ...receivedFrom, ...sentTo].map(String));
+  ids.delete(String(userId));
+  return [...ids];
+}
+
+async function broadcastPresence(userId, status, lastSeen) {
+  const audience = await presenceAudience(userId);
+  if (audience.length > 0) io.to(audience).emit('user_status', { userId, status, lastSeen });
+}
+
+/** Do these two accounts know each other — a contact link either way, or history? */
+async function areConnected(a, b) {
+  const [link, history] = await Promise.all([
+    User.exists({ $or: [{ _id: a, contacts: b }, { _id: b, contacts: a }] }),
+    Message.exists({ $or: [{ from_user_id: a, to_user_id: b }, { from_user_id: b, to_user_id: a }] }),
+  ]);
+  return Boolean(link || history);
+}
+
+// ── Security headers ──
+app.use(helmet());
+
+// ── HTTP request logger (Morgan → our logger) ──
+app.use((req, _res, next) => { req._startTime = Date.now(); next(); });
+app.use(morgan((tokens, req, res) => {
+  const ms     = Date.now() - (req._startTime || Date.now());
+  const status = parseInt(tokens.status(req, res)) || 0;
+  logger.http(req, status, ms);
+  return null; // morgan itself writes nothing; we handle output
+}));
+
+app.use(cors({ origin: config.corsOrigin }));
+app.use(express.json({ limit: '1mb' }));
+
+// ── Expose Socket.io to routes ──
+app.use((req, res, next) => {
+  req.io = io;
+  next();
+});
+
+// ── Routes ──
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many attempts from this address, please try again later' },
+});
+
+// Looking someone up by id is the one endpoint that reveals whether an account
+// exists, so it gets its own tighter budget to stop id-space probing.
+const lookupLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many lookups, slow down a moment' },
+});
+
+app.get('/api/health', (_req, res) => {
+  res.json({ ok: true, db: mongoose.connection.readyState === 1 ? 'up' : 'down' });
+});
+
+app.use('/api/auth',         authLimiter, authRoutes);
+app.use('/api/messages',     messageRoutes);
+app.use('/api/users/lookup', lookupLimiter);
+app.use('/api/users',        userRoutes);
+app.use('/api/demo',         demoRoutes);
+
+// ── Socket.io ──
+
+/** Flush anything that arrived while this user had no socket connected. */
+async function deliverPendingMessages(socket, userId) {
+  const pending = await Message.find({ to_user_id: userId, delivered: false }).sort({ timestamp: 1 });
+  if (pending.length === 0) return;
+
+  logger.info(`Delivering ${pending.length} offline message(s)`, { userId }, 'Socket');
+  for (const msg of pending) socket.emit('new_message', serializeMessage(msg));
+
+  await Message.updateMany(
+    { _id: { $in: pending.map(m => m._id) } },
+    { $set: { delivered: true } }
+  );
+
+  // Notify senders that their messages were delivered
+  const senderIds = [...new Set(pending.map(m => String(m.from_user_id)))];
+  for (const sId of senderIds) {
+    const deliveredIds = pending.filter(m => String(m.from_user_id) === sId).map(m => m._id);
+    io.to(sId).emit('message_delivered', { messageIds: deliveredIds, toUserId: userId });
+  }
+}
+
+// Reject unauthenticated sockets at the handshake, before any event can run.
+io.use(authenticateSocket);
+
+io.on('connection', async (socket) => {
+  // Identity comes from the verified handshake token only. Nothing below reads
+  // an actor id out of an event payload.
+  const userId = socket.user.id;
+  socket.join(userId);
+
+  logger.event('Socket connected', { socketId: socket.id, userId, username: socket.user.username }, 'Socket');
+
+  // Typing indicators and call signals are relayed only between accounts that
+  // already know each other, so an arbitrary user id can't be rung or spammed.
+  // Positive answers are cached for the life of the socket.
+  const reachable = new Set();
+  const canReach = async (toId) => {
+    if (!isValidObjectId(toId) || String(toId) === userId) return false;
+    const key = String(toId);
+    if (reachable.has(key)) return true;
+    if (await areConnected(userId, key)) { reachable.add(key); return true; }
+    return false;
+  };
+
+  socket.on('send_message', async ({ tempId, toId, payload, senderPayload, type, replyToId }) => {
+    logger.event('Relay message', { fromId: userId, toId }, 'Socket');
+    try {
+      if (!isValidObjectId(toId) || String(toId) === userId) {
+        return socket.emit('message_error', { tempId, error: 'INVALID_RECIPIENT' });
+      }
+      if (!payload || typeof payload !== 'object') {
+        return socket.emit('message_error', { tempId, error: 'INVALID_PAYLOAD' });
+      }
+
+      const size = approximateSize(payload) + approximateSize(senderPayload);
+      if (size > config.maxMessageBytes) {
+        logger.warn('Rejected oversized message', { fromId: userId, size }, 'Socket');
+        return socket.emit('message_error', { tempId, error: 'PAYLOAD_TOO_LARGE' });
+      }
+
+      const safeType    = ALLOWED_MESSAGE_TYPES.includes(type) ? type : 'text';
+      // A non-ObjectId reply target (e.g. a client-side temp id) would throw on
+      // save and lose the message entirely, so drop it instead.
+      const safeReplyTo = isValidObjectId(replyToId) ? replyToId : null;
+      // A message to an id with no account would sit undelivered forever.
+      if (!(await User.exists({ _id: toId }))) {
+        return socket.emit('message_error', { tempId, error: 'INVALID_RECIPIENT' });
+      }
+      const onlineBeforeSave = isUserOnline(toId);
+
+      const msg = new Message({
+        from_user_id:   userId,
+        to_user_id:     toId,
+        payload,
+        sender_payload: senderPayload || null,
+        type:           safeType,
+        reply_to_id:    safeReplyTo,
+        delivered:      onlineBeforeSave,
+      });
+      // _id and timestamp are assigned at construction, so the leaf can be
+      // computed before the first save rather than with a second write.
+      msg.leaf = leafForMessage(msg);
+      await msg.save();
+      logger.info('Message saved', { id: msg._id, fromId: userId, toId }, 'Socket');
+      reachable.add(String(toId));
+
+      // The recipient may have connected while this was saving. Their offline
+      // flush ran before the message existed, so without a second look it would
+      // sit undelivered until their next reconnect.
+      const recipientOnline = isUserOnline(toId);
+      if (recipientOnline && !onlineBeforeSave) {
+        await Message.updateOne({ _id: msg._id }, { $set: { delivered: true } });
+        msg.delivered = true;
+      }
+
+      // Hand the real id back so the sender's optimistic bubble stops carrying a
+      // temporary one — receipts, deletes, reactions and replies all key off it.
+      socket.emit('message_sent', {
+        tempId,
+        id:        msg._id,
+        timestamp: msg.timestamp,
+        delivered: recipientOnline,
+      });
+
+      if (recipientOnline) {
+        io.to(String(toId)).emit('new_message', serializeMessage(msg));
+        logger.event('Message delivered', { toId }, 'Socket');
+      } else {
+        logger.warn('Recipient offline — message persisted for delivery on reconnect', { toId }, 'Socket');
+      }
+    } catch (error) {
+      logger.error('send_message failed', { message: error.message }, 'Socket');
+      socket.emit('message_error', { tempId, error: 'SEND_FAILED' });
+    }
+  });
+
+  socket.on('webrtc_signal', async ({ toId, signalPayload } = {}) => {
+    try {
+      if (!signalPayload || typeof signalPayload !== 'object') return;
+      if (approximateSize(signalPayload) > 64 * 1024) return;
+      if (!(await canReach(toId))) {
+        return logger.warn('webrtc_signal: no relationship with recipient', { fromId: userId, toId }, 'Socket');
+      }
+      logger.event('Relay WebRTC signal', { fromId: userId, toId }, 'Socket');
+      io.to(String(toId)).emit('webrtc_signal', { fromId: userId, signalPayload });
+    } catch (err) {
+      logger.error('webrtc_signal failed', { message: err.message }, 'Socket');
+    }
+  });
+
+  // Two participants comparing their Merkle roots. The payload is sealed to the
+  // other side like any signal; the server only relays it.
+  socket.on('transcript_check', async ({ toId, payload } = {}) => {
+    try {
+      if (!payload || typeof payload !== 'object' || approximateSize(payload) > 16 * 1024) return;
+      if (!(await canReach(toId))) return;
+      io.to(String(toId)).emit('transcript_check', { fromId: userId, payload });
+    } catch (err) {
+      logger.error('transcript_check failed', { message: err.message }, 'Socket');
+    }
+  });
+
+  const relayTyping = (event) => async ({ toId } = {}) => {
+    try {
+      if (await canReach(toId)) io.to(String(toId)).emit(event, { fromId: userId });
+    } catch (err) {
+      logger.error(`${event} failed`, { message: err.message }, 'Socket');
+    }
+  };
+  socket.on('typing', relayTyping('typing'));
+  socket.on('stop_typing', relayTyping('stop_typing'));
+
+  socket.on('message_read', async ({ messageIds } = {}) => {
+    try {
+      const ids = (Array.isArray(messageIds) ? messageIds : []).filter(isValidObjectId);
+      if (ids.length === 0) return;
+
+      // Scoped to messages addressed to this user, so nobody can mark someone
+      // else's conversation as read.
+      const scope = { _id: { $in: ids }, to_user_id: userId };
+      await Message.updateMany(scope, { $set: { read: true } });
+
+      // Tell the people who actually sent those messages, not whatever id the
+      // client named — that let a receipt be pushed at any account.
+      const rows = await Message.find(scope).select('_id from_user_id').lean();
+      const bySender = new Map();
+      for (const r of rows) {
+        const sender = String(r.from_user_id);
+        if (!bySender.has(sender)) bySender.set(sender, []);
+        bySender.get(sender).push(r._id);
+      }
+      for (const [sender, messageIds] of bySender) {
+        io.to(sender).emit('message_read', { messageIds, byUserId: userId });
+      }
+    } catch (err) {
+      logger.error('Failed to update message read status', { message: err.message }, 'Socket');
+    }
+  });
+
+  socket.on('delete_message', async ({ messageId }) => {
+    try {
+      if (!isValidObjectId(messageId)) return;
+
+      // Ownership is enforced in the query: only the sender can delete.
+      const msg = await Message.findOneAndUpdate(
+        { _id: messageId, from_user_id: userId },
+        { $set: { deleted: true, payload: {}, sender_payload: {}, reactions: [] } },
+        { new: true }
+      );
+      if (!msg) {
+        return logger.warn('delete_message: not found or not owned', { messageId, userId }, 'Socket');
+      }
+      // A delete changes the leaf to the "deleted" form, which every client
+      // computes identically — so it reads as a delete, not as tampering.
+      await Message.updateOne({ _id: msg._id }, { $set: { leaf: leafForMessage(msg) } });
+
+      io.to(String(msg.to_user_id)).emit('message_deleted', { messageId });
+      io.to(String(msg.from_user_id)).emit('message_deleted', { messageId });
+    } catch (err) {
+      logger.error('Failed to delete message', { message: err.message }, 'Socket');
+    }
+  });
+
+  socket.on('message_reaction', async ({ messageId, payload }) => {
+    try {
+      if (!isValidObjectId(messageId)) return;
+      // The emoji set is encrypted, so the server can't inspect or toggle it.
+      // The client sends its complete set; we blindly replace that user's entry,
+      // or drop it when the set is empty.
+      if (payload !== null && (typeof payload !== 'object' || Array.isArray(payload))) return;
+      if (approximateSize(payload) > 64 * 1024) return;
+
+      // Only a participant may react, and not to a deleted message.
+      const scope = {
+        _id: messageId,
+        deleted: { $ne: true },
+        $or: [{ from_user_id: userId }, { to_user_id: userId }],
+      };
+      const msg = await Message.findOne(scope).select('from_user_id to_user_id').lean();
+      if (!msg) {
+        return logger.warn('message_reaction: not found, deleted, or not a participant', { messageId, userId }, 'Socket');
+      }
+
+      // Two atomic updates rather than load-modify-save. Saving the whole array
+      // raced: when both people reacted at once, the second save failed its
+      // version check and that reaction silently vanished.
+      await Message.updateOne(scope, { $pull: { reactions: { user_id: userId } } });
+      if (payload) {
+        // The $ne guard stops a fast double-tap leaving two rows for one user.
+        await Message.updateOne(
+          { ...scope, 'reactions.user_id': { $ne: userId } },
+          { $push: { reactions: { user_id: userId, payload } } },
+        );
+      }
+
+      // Broadcast the authoritative array; clients replace rather than append,
+      // which is what stops a reaction being counted twice on the sender's side.
+      const fresh = await Message.findById(messageId).select('reactions').lean();
+      const update = { messageId, reactions: fresh?.reactions || [] };
+      for (const participant of new Set([String(msg.from_user_id), String(msg.to_user_id)])) {
+        io.to(participant).emit('message_reaction', update);
+      }
+    } catch (err) {
+      logger.error('Failed to add reaction', { message: err.message }, 'Socket');
+    }
+  });
+
+  socket.on('disconnect', async (reason) => {
+    // Rooms are left before 'disconnect' fires, so this reflects the user's
+    // other tabs (if any) rather than the socket that just went away.
+    const stillOnline = isUserOnline(userId);
+    logger.event('User disconnected', { userId, reason, stillOnline }, 'Socket');
+    if (stillOnline) return;
+
+    try {
+      const lastSeen = new Date();
+      await User.findByIdAndUpdate(userId, { is_online: false, last_seen: lastSeen });
+      await broadcastPresence(userId, 'offline', lastSeen);
+    } catch (err) {
+      logger.error('Failed to record disconnect', { message: err.message, userId }, 'Socket');
+    }
+  });
+
+  // Setup runs after every handler is registered. It used to run first, and
+  // because it awaits the database, anything the client emitted straight after
+  // connecting arrived while no handler existed and was silently dropped.
+  try {
+    // A socket that dropped before setup ran must not mark its user online
+    // after the disconnect handler has already marked them offline.
+    if (socket.disconnected) return;
+    const now = new Date();
+    await User.findByIdAndUpdate(userId, { is_online: true, last_seen: now });
+    await broadcastPresence(userId, 'online', now);
+    await deliverPendingMessages(socket, userId);
+  } catch (err) {
+    logger.error('Connection setup failed', { message: err.message, userId }, 'Socket');
+  }
+});
+
+io.engine.on('connection_error', (err) => {
+  logger.warn('Socket handshake rejected', { code: err.code, message: err.message }, 'Socket');
+});
+
+// ── Global error handler ──
+app.use((err, req, res, _next) => {
+  logger.error('Unhandled express error', { message: err.message, stack: err.stack }, 'Express');
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+httpServer.listen(config.port, () => {
+  logger.info(`QChat backend running`, { port: config.port, env: config.nodeEnv, cors: config.corsOrigin }, 'Server');
+  if (config.demoMode) {
+    logger.warn('DEMO MODE — the attack simulator is enabled. Never run this way for real users.', null, 'Server');
+  }
+});
+
+// Close sockets and the database cleanly on Ctrl-C or a container stop, so
+// clients see a disconnect (and reconnect) instead of a hung connection.
+let shuttingDown = false;
+const shutdown = (signal) => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.warn(`${signal} received — shutting down`, null, 'Server');
+  io.close(() => {
+    mongoose.connection.close().finally(() => process.exit(0));
+  });
+  setTimeout(() => process.exit(1), 5000).unref();
+};
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
